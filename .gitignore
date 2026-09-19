@@ -1,0 +1,10 @@
+# private: webhook URL, ping ID, session history, screenshots of your screen
+minigame_tracker_config.json
+minigame_tracker.log
+ocr_calibration/
+
+# build output and Python leftovers
+build/
+dist/
+__pycache__/
+.venv/
