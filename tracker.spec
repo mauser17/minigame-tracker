@@ -66,10 +66,66 @@ a = Analysis(
     hookspath=[],
     runtime_hooks=[],
     # Never imported by the tracker. pytesseract only *tries* numpy/pandas and
-    # works without them, so leaving them out saves a lot of size.
-    excludes=["tkinter", "numpy", "pandas"],
+    # works without them, so leaving them out saves a lot of size. The Pillow
+    # entries are image formats the tracker never opens; Pillow loads its
+    # format plugins in a try/except, so their absence is simply ignored.
+    excludes=[
+        "tkinter", "numpy", "pandas",
+        "PIL.AvifImagePlugin", "PIL.ImageQt", "PIL.ImageTk", "PIL.ImageShow",
+    ],
     noarchive=False,
 )
+
+# ---------------------------------------------------------------- slimming
+# Qt ships a lot this app never touches. Measured on the first build: these
+# accounted for ~36 MB of 167 MB before compression.
+#   opengl32sw.dll  Qt's software 3D renderer, for OpenGL/Quick; a widgets app
+#                   painted by the raster engine never loads it
+#   Qt6Pdf          no PDF anywhere in the app
+#   Qt6Network      networking goes through Python's requests, not Qt
+#   Qt6Svg + the svg/jpeg/webp/tiff image plugins
+#                   the only images are PNG (the spin-box arrows) and the .ico
+UNUSED_QT = {
+    "opengl32sw.dll", "qt6pdf.dll", "qt6network.dll", "qt6svg.dll",
+    "qjpeg.dll", "qwebp.dll", "qtiff.dll", "qsvg.dll", "qsvgicon.dll",
+    "qpdf.dll",
+}
+
+
+def _is_unused_qt(dest):
+    return os.path.basename(dest).lower() in UNUSED_QT
+
+
+def _is_qt_translation(dest):
+    parts = dest.replace("\\", "/").lower().split("/")
+    return "translations" in parts and parts[-1].endswith(".qm")
+
+
+def _is_duplicate_tesseract(dest, source):
+    """A Tesseract file that PyInstaller also copied to the TOP LEVEL.
+
+    PyInstaller analyses the Tesseract DLLs we ship as data and adds its own
+    copy of each one at the root, so every file ended up in the exe twice
+    (26 MB wasted). Only the root copies are dropped: the ones under
+    "tesseract/" are what tesseract.exe loads, and removing those leaves the
+    exe with no OCR engine at all, silently falling back to a Tesseract
+    installed on the user's PC. Python's own OpenSSL DLLs are named
+    differently and come from elsewhere, so they are never touched.
+    """
+    if os.path.dirname(dest):          # keep anything inside a folder
+        return False
+    try:
+        return os.path.commonpath([os.path.abspath(source), str(TESSERACT_DIR)]) == str(TESSERACT_DIR)
+    except ValueError:                 # different drives
+        return False
+
+
+before = len(a.binaries) + len(a.datas)
+a.binaries = [b for b in a.binaries
+              if not _is_unused_qt(b[0]) and not _is_duplicate_tesseract(b[0], b[1])]
+a.datas = [d for d in a.datas if not _is_unused_qt(d[0]) and not _is_qt_translation(d[0])]
+print(f"[tracker.spec] slimming: dropped {before - len(a.binaries) - len(a.datas)} files "
+      "(duplicated Tesseract DLLs, unused Qt modules, Qt translations)")
 
 pyz = PYZ(a.pure)
 
