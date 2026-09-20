@@ -114,23 +114,26 @@ def feed(detector, readings, clock=None, step=0.2):
     return events
 
 
-def new_detector(clock, reward_wait=5.0, clean_reads=3):
-    return EventDetector(
-        reward_wait_seconds=reward_wait,
-        clean_reads_required=clean_reads,
-        clock=clock,
-    )
+def new_detector(clock, clean_reads=3):
+    return EventDetector(clean_reads_required=clean_reads, clock=clock)
 
 
 def reward_window(detector, clock, reading, polls=25, step=0.2):
-    """Hold a reward popup on screen for the whole voting window.
+    """Hold ONE unchanging reward popup on screen.
 
-    A success is no longer emitted on the first reading that carries a number:
-    the detector collects every reading for reward_wait_seconds and takes the
-    majority, because the digit is the least reliable character on screen.
-    Tests therefore have to let that window elapse.
+    Repeating the same reading is not new evidence, so this never triggers the
+    agreement rule. It settles once the readings have stopped changing.
     """
     return feed(detector, [reading] * polls, clock, step=step)
+
+
+def changing(reading, count):
+    """The same reward read `count` times, each reading slightly different.
+
+    Real frames never come out byte-identical while a popup fades, and only a
+    CHANGED reading counts as new evidence.
+    """
+    return [reading + " " + "." * i for i in range(count)]
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +528,7 @@ class TestEventDetector(unittest.TestCase):
         """Same as above but using the value tracker.py actually ships, so the
         constant can't be lowered to an unsafe number without a test failing."""
         clock = FakeClock()
-        d = EventDetector(reward_wait_seconds=5.0, clock=clock)  # default clean reads
+        d = EventDetector(clock=clock)  # shipped clean-read count
         self.assertGreaterEqual(tracker.CLEAN_READS_REQUIRED, 3)
         blip = [""] * (tracker.CLEAN_READS_REQUIRED - 1)
         readings = (
@@ -540,7 +543,7 @@ class TestEventDetector(unittest.TestCase):
 
     def test_shipped_constant_still_allows_a_later_real_event(self):
         clock = FakeClock()
-        d = EventDetector(reward_wait_seconds=5.0, clock=clock)
+        d = EventDetector(clock=clock)
         events = feed(d, [FAIL_TEXT] * 4 + [""] * (tracker.CLEAN_READS_REQUIRED + 2), clock)
         clock.advance(180)
         events += feed(d, [SUCCESS_TEXT] * 3, clock)
@@ -588,7 +591,7 @@ class TestEventDetector(unittest.TestCase):
         """The popup appeared ~1.5s before the window would close, and the
         readable frames only came afterwards. Those later frames must vote."""
         clock = FakeClock()
-        d = new_detector(clock)                      # reward_wait = 5.0
+        d = new_detector(clock)
         events = feed(d, [SUCCESS_TEXT] * 18, clock)  # first reward read at ~3.6s
         events += feed(d, ["minigame\nyou've got 7 normol summer rondom box!"] * 9, clock)
         self.assertEqual(events, [], "decided before the minimum vote time had passed")
@@ -612,7 +615,7 @@ class TestEventDetector(unittest.TestCase):
         "cleared" in real sessions. Even with a 3s reward wait setting, a
         reward that shows up at ~9s must be counted."""
         clock = FakeClock()
-        d = new_detector(clock, reward_wait=3.0)
+        d = new_detector(clock)
         events = feed(d, [SUCCESS_TEXT] * 45, clock)         # 9s, nothing readable
         self.assertEqual(events, [], "gave up before the popup appeared")
         events += reward_window(d, clock, "minigame\nyou've got 2 nonnol summer rondom box!")
@@ -622,7 +625,7 @@ class TestEventDetector(unittest.TestCase):
 
     def test_gives_up_after_the_maximum_wait(self):
         clock = FakeClock()
-        d = new_detector(clock, reward_wait=3.0)
+        d = new_detector(clock)
         events = feed(d, [SUCCESS_TEXT] * 55, clock)          # 11s: still hoping
         self.assertEqual(events, [])
         clock.advance(2)                                      # past 12s
@@ -649,6 +652,50 @@ class TestEventDetector(unittest.TestCase):
         feed(d, ["session so far: 3 success - 1 fail"] * 10, clock)
         self.assertEqual(d.state, EventDetector.AWAITING_CLEAR,
                          "a Discord frame was counted as a clean read")
+
+    def test_agreement_settles_the_reward_quickly(self):
+        """Three readings that agree end it: no waiting on a clock."""
+        clock = FakeClock()
+        d = new_detector(clock)
+        feed(d, [SUCCESS_TEXT], clock)
+        started = clock.t
+        events = feed(d, changing("minigame\nyou've got 2 rare summer random box!", 3), clock)
+        self.assertEqual(len(events), 1, "did not settle on three agreeing readings")
+        self.assertEqual((events[0].reward_name, events[0].qty), ("Rare Summer Random Box", 2))
+        self.assertLess(clock.t - started, 1.0, "took too long for three agreeing readings")
+
+    def test_the_same_frame_repeated_is_not_agreement(self):
+        """The capture loop repeats the last reading while the screen is
+        unchanged. Counting that as agreement would prove nothing, so an
+        unchanging popup settles on time instead."""
+        clock = FakeClock()
+        d = new_detector(clock)
+        feed(d, [SUCCESS_TEXT], clock)
+        reading = "minigame\nyou've got 2 rare summer random box!"
+        events = feed(d, [reading] * 5, clock)          # 1s of the identical frame
+        self.assertEqual(events, [], "the same frame counted as agreement")
+        events = feed(d, [reading] * 8, clock)          # past the settle time
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].qty, 2)
+
+    def test_a_vanished_popup_settles_it(self):
+        clock = FakeClock()
+        d = new_detector(clock)
+        feed(d, [SUCCESS_TEXT], clock)
+        feed(d, ["minigame\nyou've got 1 mega summer random box!"], clock)
+        events = feed(d, [SUCCESS_TEXT] * tracker.REWARD_GONE_READS, clock)
+        self.assertEqual(len(events), 1, "popup disappeared but nothing was reported")
+        self.assertEqual(events[0].reward_name, "Mega Summer Random Box")
+
+    def test_a_misread_frame_cannot_win_by_repeating(self):
+        """One bad reading repeated must not beat the readings that agree."""
+        clock = FakeClock()
+        d = new_detector(clock)
+        feed(d, [SUCCESS_TEXT], clock)
+        feed(d, ["minigame\nyou've got 3 rare summer random box!"] * 6, clock)
+        events = feed(d, changing("minigame\nyou've got 1 rare summer random box!", 3), clock)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].qty, 1, "the repeated frame won")
 
     def test_reward_text_alone_while_idle_is_not_an_event(self):
         clock = FakeClock()
@@ -851,6 +898,42 @@ class TestMentionFormatting(unittest.TestCase):
         self.assertEqual(tracker.format_mention("@SomeUser"), "@SomeUser")
 
 
+class TestPingTargets(unittest.TestCase):
+    """Regression: a ping target of "mcorecxre" arrived in Discord as plain
+    grey text and notified nobody, with nothing in the app to say why."""
+
+    def test_a_name_is_reported_as_unusable(self):
+        for raw in ("mcorecxre", "@mcorecxre", "Miko#1234", "some name"):
+            with self.subTest(raw=raw):
+                problem = tracker.ping_problem(raw)
+                self.assertIsNotNone(problem, raw)
+                self.assertIn("ID", problem)
+
+    def test_usable_targets_report_no_problem(self):
+        for raw in ("", "   ", None, "123456789012345678", "<@123456789012345678>",
+                    "<@&123456789012345678>", "role:123456789012345678",
+                    "@everyone", "@here", "here"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(tracker.ping_problem(raw))
+
+    def test_allowed_mentions_name_the_exact_target(self):
+        """Without this a role ping only works if the role is mentionable."""
+        self.assertEqual(tracker.allowed_mentions_for("<@&123456789012345678>"),
+                         {"parse": [], "roles": ["123456789012345678"]})
+        self.assertEqual(tracker.allowed_mentions_for("<@123456789012345678>"),
+                         {"parse": [], "users": ["123456789012345678"]})
+        self.assertEqual(tracker.allowed_mentions_for("<@!123456789012345678>"),
+                         {"parse": [], "users": ["123456789012345678"]})
+        self.assertEqual(tracker.allowed_mentions_for("@everyone"), {"parse": ["everyone"]})
+        self.assertEqual(tracker.allowed_mentions_for("@here"), {"parse": ["everyone"]})
+
+    def test_nothing_is_pingable_by_default(self):
+        """A stray "@everyone" inside OCR text must never fire a mass ping."""
+        for raw in ("", None, "mcorecxre", "@everyone is here"):
+            with self.subTest(raw=raw):
+                self.assertEqual(tracker.allowed_mentions_for(raw), {"parse": []})
+
+
 class TestWebhookPayload(unittest.TestCase):
     class _Response:
         status_code, text, ok = 204, "", True
@@ -877,6 +960,13 @@ class TestWebhookPayload(unittest.TestCase):
         payload = self._capture(content="<@123456789012345678>")
         self.assertEqual(payload["content"], "<@123456789012345678>")
         self.assertEqual(payload["embeds"], [{"title": "x"}])
+        self.assertEqual(payload["allowed_mentions"],
+                         {"parse": [], "users": ["123456789012345678"]})
+
+    def test_a_role_ping_is_allowed_explicitly(self):
+        payload = self._capture(content="<@&987654321098765432>")
+        self.assertEqual(payload["allowed_mentions"],
+                         {"parse": [], "roles": ["987654321098765432"]})
 
     def test_no_content_key_without_a_ping(self):
         for kwargs in ({}, {"content": ""}, {"content": None}):
@@ -1008,6 +1098,33 @@ class TestEmbeds(unittest.TestCase):
         self.assertEqual(len({len(line) for line in lines}), 1, lines)
         self.assertTrue(lines[0].endswith("350"))
         self.assertTrue(lines[1].rstrip().endswith("0"))
+
+
+class TestSettingsThatWereRemoved(unittest.TestCase):
+    def test_no_reward_wait_or_poll_interval_settings(self):
+        """Both were replaced: the reward is settled by agreement, and the
+        poll rate is fixed. Old config files still load."""
+        self.assertNotIn("reward_wait_seconds", tracker.DEFAULT_CONFIG)
+        self.assertNotIn("poll_interval", tracker.DEFAULT_CONFIG)
+        self.assertEqual(tracker.POLL_INTERVAL_SECONDS, 0.20)
+
+    def test_an_old_config_still_loads(self):
+        import json
+        import tempfile
+        old = {"region": {"top": 1, "left": 2, "width": 3, "height": 4},
+               "poll_interval": 0.5, "reward_wait_seconds": 3.0,
+               "webhook_url": "https://example.invalid/hook"}
+        path = Path(tempfile.mkdtemp()) / "minigame_tracker_config.json"
+        path.write_text(json.dumps(old), encoding="utf-8")
+        saved = tracker.CONFIG_PATH
+        tracker.CONFIG_PATH = path
+        try:
+            cfg = tracker.load_config()
+        finally:
+            tracker.CONFIG_PATH = saved
+        self.assertEqual(cfg["region"], old["region"])
+        self.assertEqual(cfg["webhook_url"], old["webhook_url"])
+        self.assertEqual(cfg["inactivity_minutes"], 0.0)   # new key gets its default
 
 
 class TestPackagedPaths(unittest.TestCase):

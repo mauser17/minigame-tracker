@@ -19,7 +19,8 @@ summer minigame event.
 - Rewards are matched structurally: first the family ("summer random box" vs
   "boost module"), then the distinguishing word, so a word-wrapped OR
   OCR-corrupted reward line still counts correctly without garbage matching
-- Detects success, waits briefly for the stacked reward popup, tallies rewards
+- Detects success, then settles the reward as soon as several readings agree
+  (no "reward wait" setting: a clock was the wrong tool for it)
 - Start / Pause / Resume / Stop, with a full end-of-session report
 - Header with a status dot (gray idle, green running, amber paused, red
   stopped) and a session timer counting ACTIVE tracking time: it stops while
@@ -132,10 +133,11 @@ LOG_PATH = _app_dir() / "minigame_tracker.log"
 
 log = logging.getLogger("minigame_tracker")
 
+# Old config files may still carry "poll_interval" and "reward_wait_seconds".
+# They are ignored now (see REWARD_AGREEMENT_READS) and simply travel along
+# harmlessly, so a config written by an older version still loads.
 DEFAULT_CONFIG = {
     "region": {"top": 700, "left": 1400, "width": 500, "height": 350},
-    "poll_interval": 0.20,
-    "reward_wait_seconds": 5.00,
     "webhook_url": "",
     # 0 = inactivity alerts off. Above that, minutes of active tracking with
     # no result before a single alert is sent.
@@ -166,19 +168,32 @@ CLEAN_READS_REQUIRED = 5
 # is the same notification being re-read. Suppressed hits are logged as
 # warnings so an early release would be visible in the log.
 MIN_SECONDS_BETWEEN_EVENTS = 10.0
-# The reward popup appears seconds AFTER "cleared", so a vote window measured
-# only from "cleared" can close just as the first reward reading arrives. A real
-# session decided "7 Normal" on a single reading that came ~1.5s before the
-# window closed; the correct "got 1" was read 7s later. So once the first
-# reward reading arrives, voting always continues for at least this long.
-REWARD_VOTE_MIN_SECONDS = 3.0
-# If NO reward text has been read by the time the reward wait ends, keep
-# looking up to this long before giving up as "Unrecognized". Measured over
-# 756 real successes: the first readable reward frame arrived a median 3.2s
-# after "cleared" and as late as 10.7s. With the Reward wait setting at 3s,
-# a large share of readable rewards were being given up on moments too early.
-# Only the no-text-yet case waits this long, so normal runs are not slowed.
+# How the reward is settled. There is no "reward wait" setting: waiting on a
+# clock was the wrong tool. A fixed wait is either too short (a real session
+# set 3s and lost rewards whose popup appeared at 3.2s) or slower than needed
+# (waiting 12s for a reward that was already read three times).
+#
+# Instead the reward is settled by AGREEMENT. A success is reported as soon as
+# this many readings agree on the same reward and amount, which usually takes
+# under a second, and guards against the single-frame digit misreads the font
+# produces ("1" read as "7" in ~9% of readings, 43% in Snowy).
+REWARD_AGREEMENT_READS = 3
+# A reading only counts when the text CHANGED. The capture loop re-uses the
+# previous reading while the screen is unchanged, so without this the same
+# frame would "agree" with itself and prove nothing.
+#
+# When the popup stops changing there is no more evidence to gather, so settle
+# on what we have this long after the last new reading.
+REWARD_SETTLE_SECONDS = 2.0
+# The popup vanished: decide on what was seen after this many clear readings.
+REWARD_GONE_READS = 3
+# Backstop. Nothing readable by now: report the success with the reward marked
+# unread. Measured over 756 real successes, the first readable reward frame
+# arrived a median 3.2s after "cleared" and as late as 10.7s.
 REWARD_WAIT_MAX_SECONDS = 12.0
+# How often the screen is captured. Fixed: 0.2s is fast enough to catch every
+# notification and slow enough to leave the game alone.
+POLL_INTERVAL_SECONDS = 0.20
 
 # ---------------------------------------------------------------------------
 # OCR preprocessing tuning
@@ -420,6 +435,7 @@ QLabel#hintText {
     color: %(muted)s;
     font-size: 9pt;
 }
+QLabel#hintText[tone="fail"] { color: %(red)s; }
 
 /* ---- Inputs ---------------------------------------------------------- */
 QLineEdit, QDoubleSpinBox, QTextEdit {
@@ -807,20 +823,20 @@ class EventDetector:
 
     def __init__(
         self,
-        reward_wait_seconds: float = 5.0,
         clean_reads_required: int = CLEAN_READS_REQUIRED,
         min_event_gap_seconds: float = MIN_SECONDS_BETWEEN_EVENTS,
-        reward_vote_min_seconds: float = REWARD_VOTE_MIN_SECONDS,
+        agreement_reads: int = REWARD_AGREEMENT_READS,
+        settle_seconds: float = REWARD_SETTLE_SECONDS,
+        gone_reads: int = REWARD_GONE_READS,
         reward_wait_max_seconds: float = REWARD_WAIT_MAX_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ):
-        self.reward_wait_seconds = float(reward_wait_seconds)
         self.clean_reads_required = max(1, int(clean_reads_required))
         self.min_event_gap_seconds = float(min_event_gap_seconds)
-        self.reward_vote_min_seconds = float(reward_vote_min_seconds)
-        # Never shorter than the normal wait, whatever the setting says.
-        self.reward_wait_max_seconds = max(float(reward_wait_max_seconds),
-                                           self.reward_wait_seconds)
+        self.agreement_reads = max(1, int(agreement_reads))
+        self.settle_seconds = float(settle_seconds)
+        self.gone_reads = max(1, int(gone_reads))
+        self.reward_wait_max_seconds = float(reward_wait_max_seconds)
         self._clock = clock
         self.reset()
 
@@ -847,6 +863,11 @@ class EventDetector:
         self._votes: List[RewardMatch] = []
         self._first_reward_at: Optional[float] = None
         self._rejected: Counter = Counter()
+        self._last_reading: Optional[str] = None
+        self._last_new_reading_at: float = 0.0
+        self._agreed: Optional[tuple] = None
+        self._agreed_count: int = 0
+        self._gone_count: int = 0
 
     def _decide_reward(self, text):
         """Settle on one reward from everything seen during the reward window.
@@ -877,11 +898,11 @@ class EventDetector:
         if self._provisional is not None:
             return (
                 Event("success", self._provisional.qty, self._provisional.name, text),
-                "reward wait elapsed; only a fragment without a quantity was read",
+                "only a fragment without a quantity was read",
             )
         return (
             Event("success", 0, "Unrecognized: (no reward text seen)", text),
-            "reward wait elapsed; no reward text",
+            "no reward text",
         )
 
     def _start_awaiting_clear(self, reason: str):
@@ -949,17 +970,30 @@ class EventDetector:
                 self._start_awaiting_clear("fail interrupted pending success")
                 return events
 
+            # Only a CHANGED reading is new evidence: the capture loop repeats
+            # the previous reading while the screen is unchanged.
+            fresh = text != self._last_reading
+            self._last_reading = text
+            if fresh:
+                self._last_new_reading_at = now
+
             if reward is not None:
                 if self._first_reward_at is None:
                     self._first_reward_at = now
-                if reward.qty_explicit:
-                    # Do NOT emit on the first reading that carries a number.
-                    # A real capture read the same popup as "got 7 Mega" on one
-                    # frame and "got 1 Mega" on the next, and the first read won
-                    # — logging seven boxes for one. The popup stays up for many
-                    # polls, so collect every reading and take the majority.
+                self._gone_count = 0
+                if fresh and reward.qty_explicit:
                     self._votes.append(reward)
-                else:
+                    key = (reward.name, reward.qty)
+                    self._agreed_count = self._agreed_count + 1 if key == self._agreed else 1
+                    self._agreed = key
+                    if self._agreed_count >= self.agreement_reads:
+                        events.append(self._emit(
+                            Event("success", reward.qty, reward.name, text), now))
+                        self._clear_reward_window()
+                        self._start_awaiting_clear(
+                            f"{self._agreed_count} readings agreed on the reward")
+                        return events
+                elif fresh:
                     if reward.rejected_qty is not None:
                         self._rejected[reward.rejected_qty] += 1
                     if self._provisional is None:
@@ -968,24 +1002,26 @@ class EventDetector:
                             "provisional reward %r seen without a believable quantity; waiting for a fuller read",
                             reward.name,
                         )
+            elif self._first_reward_at is not None:
+                # The popup was there and is now gone: no more evidence coming.
+                self._gone_count += 1
+                if self._gone_count >= self.gone_reads:
+                    ev, reason = self._decide_reward(text)
+                    events.append(self._emit(ev, now))
+                    self._clear_reward_window()
+                    self._start_awaiting_clear(f"reward popup gone; {reason}")
+                    return events
 
-            waited = now - self._pending_since
-            window_elapsed = waited > self.reward_wait_seconds
-            still_voting = (
-                self._first_reward_at is not None
-                and (now - self._first_reward_at) < self.reward_vote_min_seconds
+            settled = (
+                (self._votes or self._provisional)
+                and (now - self._last_new_reading_at) >= self.settle_seconds
             )
-            # Nothing read at all yet: the popup may just be slow. Keep looking
-            # up to the maximum before settling for "Unrecognized".
-            still_hoping = (
-                self._first_reward_at is None
-                and waited <= self.reward_wait_max_seconds
-            )
-            if window_elapsed and not still_voting and not still_hoping:
+            if settled or (now - self._pending_since) > self.reward_wait_max_seconds:
+                why = "readings stopped changing" if settled else "gave up waiting"
                 ev, reason = self._decide_reward(text)
                 events.append(self._emit(ev, now))
                 self._clear_reward_window()
-                self._start_awaiting_clear(reason)
+                self._start_awaiting_clear(f"{why}; {reason}")
             return events
 
         # IDLE
@@ -1012,9 +1048,12 @@ class EventDetector:
             self.state = self.PENDING_REWARD
             self._pending_since = now
             self._clear_reward_window()
+            self._last_reading = text
+            self._last_new_reading_at = now
             log.debug(
-                "-> pending_reward (success seen); waiting up to %.1fs for reward text",
-                self.reward_wait_seconds,
+                "-> pending_reward (success seen); settling by agreement of %d readings, "
+                "or %.0fs at the latest",
+                self.agreement_reads, self.reward_wait_max_seconds,
             )
         return events
 
@@ -1121,6 +1160,41 @@ class InactivityMonitor:
 _MENTION_RE = re.compile(r"^<@[!&]?\d{5,25}>$")
 _ROLE_RE = re.compile(r"^(?:role[:\s]+|&)(\d{5,25})$", re.IGNORECASE)
 _ID_RE = re.compile(r"^(\d{5,25})$")
+
+
+def ping_problem(raw) -> Optional[str]:
+    """Why this ping target will not ping, or None if it will.
+
+    Discord can only ping by ID, never by name, and a name typed here fails
+    silently in Discord: the message arrives with plain grey text and nobody is
+    notified. The app says so instead."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    mention = format_mention(text)
+    if mention in ("@everyone", "@here") or mention.startswith("<@"):
+        return None
+    return ("Discord pings by ID, not by name. In Discord type \\@name, send it, "
+            "then paste what it turns into here.")
+
+
+def allowed_mentions_for(mention) -> dict:
+    """Tell Discord exactly which ping this message may fire.
+
+    Without this a role ping only works when the role is marked mentionable;
+    naming the role makes it work either way. It also means a stray "@everyone"
+    inside OCR text or a reward name can never trigger a mass ping."""
+    if not mention:
+        return {"parse": []}
+    if mention in ("@everyone", "@here"):
+        return {"parse": ["everyone"]}
+    role = re.fullmatch(r"<@&(\d+)>", mention)
+    if role:
+        return {"parse": [], "roles": [role.group(1)]}
+    user = re.fullmatch(r"<@!?(\d+)>", mention)
+    if user:
+        return {"parse": [], "users": [user.group(1)]}
+    return {"parse": []}
 
 
 def format_mention(raw) -> str:
@@ -1417,6 +1491,7 @@ def post_webhook(url, embed, content=None):
     payload = {"username": "Minigame Tracker", "embeds": [embed]}
     if content:
         payload["content"] = content
+        payload["allowed_mentions"] = allowed_mentions_for(content)
     try:
         r = requests.post(url, json=payload, timeout=8)
     except Exception as e:
@@ -1530,15 +1605,14 @@ class OCRWorker(QThread):
 
     def run(self):
         region = self.config["region"]
-        interval = float(self.config.get("poll_interval", 0.20))
-        reward_wait = float(self.config.get("reward_wait_seconds", 5.00))
+        interval = POLL_INTERVAL_SECONDS
 
-        detector = EventDetector(reward_wait_seconds=reward_wait)
+        detector = EventDetector()
         last_hash = None
         last_text = ""
         log.info(
-            "session started: region=%s poll=%.2fs reward_wait=%.1fs clean_reads=%d",
-            region, interval, reward_wait, CLEAN_READS_REQUIRED,
+            "session started: region=%s poll=%.2fs agreement=%d clean_reads=%d",
+            region, interval, REWARD_AGREEMENT_READS, CLEAN_READS_REQUIRED,
         )
 
         with mss.mss() as sct:
@@ -1768,16 +1842,9 @@ class MainWindow(QWidget):
 
         self.webhook_input = QLineEdit(self.config["webhook_url"])
         self.webhook_input.setPlaceholderText("Discord webhook URL (optional)")
-        self.interval_input = QDoubleSpinBox()
-        self.interval_input.setRange(0.05, 5.0)
-        self.interval_input.setSingleStep(0.05)
-        self.interval_input.setValue(float(self.config["poll_interval"]))
-        self.reward_wait_input = QDoubleSpinBox()
-        self.reward_wait_input.setRange(1.0, 30.0)
-        self.reward_wait_input.setSingleStep(0.5)
-        self.reward_wait_input.setValue(float(self.config["reward_wait_seconds"]))
         self.ping_input = QLineEdit(self.config["ping_target"])
         self.ping_input.setPlaceholderText("user id, role id, @everyone or @here (optional)")
+        self.ping_input.textChanged.connect(self._check_ping_target)
         self.inactivity_input = QDoubleSpinBox()
         self.inactivity_input.setRange(0.0, 240.0)
         self.inactivity_input.setDecimals(1)
@@ -1785,8 +1852,7 @@ class MainWindow(QWidget):
         # At the minimum the box reads "Off" instead of 0.0.
         self.inactivity_input.setSpecialValueText("Off")
         self.inactivity_input.setValue(float(self.config["inactivity_minutes"]))
-        for spin in (self.interval_input, self.reward_wait_input, self.inactivity_input):
-            spin.setFixedWidth(96)
+        self.inactivity_input.setFixedWidth(96)
         alert_row = QHBoxLayout()
         alert_row.setSpacing(8)
         alert_row.addWidget(self.inactivity_input)
@@ -1794,15 +1860,14 @@ class MainWindow(QWidget):
 
         form.addRow("OCR region", region_row)
         form.addRow("Webhook URL", self.webhook_input)
-        form.addRow("Poll interval (s)", self.interval_input)
-        form.addRow("Reward wait (s)", self.reward_wait_input)
         form.addRow("Inactivity alert (min)", alert_row)
         column.addLayout(form)
 
-        hint = QLabel("Inactivity alert pings that target once if nothing is detected for that long.")
-        hint.setObjectName("hintText")
-        hint.setWordWrap(True)
-        column.addWidget(hint)
+        self.ping_hint = QLabel()
+        self.ping_hint.setObjectName("hintText")
+        self.ping_hint.setWordWrap(True)
+        column.addWidget(self.ping_hint)
+        self._check_ping_target()
 
         webhook_row = QHBoxLayout()
         webhook_row.setSpacing(10)
@@ -1958,6 +2023,14 @@ class MainWindow(QWidget):
             _set_style_property(widget, "state", state)
         self._refresh_timer()
 
+    def _check_ping_target(self):
+        """Say so in the app when the ping target can't ping. Discord fails
+        silently otherwise: the message arrives with the name as plain text."""
+        problem = ping_problem(self.ping_input.text())
+        _set_style_property(self.ping_hint, "tone", "fail" if problem else "")
+        self.ping_hint.setText(
+            problem or "Inactivity alert pings that target once if nothing is detected for that long.")
+
     def _refresh_region_label(self):
         r = self.config["region"]
         self.region_label.setText(f"({r['left']}, {r['top']})  {r['width']}×{r['height']} px")
@@ -2045,8 +2118,6 @@ class MainWindow(QWidget):
     def _sync_config_from_inputs(self):
         self.config["webhook_url"] = self.webhook_input.text()
         self.config["ping_target"] = self.ping_input.text().strip()
-        self.config["poll_interval"] = self.interval_input.value()
-        self.config["reward_wait_seconds"] = self.reward_wait_input.value()
         self.config["inactivity_minutes"] = self.inactivity_input.value()
 
     def start_session(self):
